@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm"
 import remarkMath from "remark-math"
 import rehypeKatex from "rehype-katex"
 import "katex/dist/katex.min.css"
+import "@/components/reader/pdf-text-layer.css"
 import {
   FileText,
   Image as ImageIcon,
@@ -107,6 +108,7 @@ function PdfPreview({ filePath, content }: { filePath: string; content: string }
   const [loadError, setLoadError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const textLayerRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     let disposed = false
@@ -161,9 +163,11 @@ function PdfPreview({ filePath, content }: { filePath: string; content: string }
   useEffect(() => {
     if (!document || showText) return
     const canvas = canvasRef.current
+    const textContainer = textLayerRef.current
     if (!canvas) return
     let disposed = false
     let renderTask: RenderTask | null = null
+    let textLayer: { cancel: () => void } | null = null
 
     void (async () => {
       try {
@@ -183,7 +187,25 @@ function PdfPreview({ filePath, content }: { filePath: string; content: string }
           viewport,
           transform: pixelRatio === 1 ? undefined : [pixelRatio, 0, 0, pixelRatio, 0, 0],
         })
+        // Size the text layer to the CSS viewport so selectable text lines up
+        // with the canvas at every zoom level.
+        if (textContainer) {
+          textContainer.replaceChildren()
+          textContainer.style.width = canvas.style.width
+          textContainer.style.height = canvas.style.height
+          textContainer.style.setProperty("--total-scale-factor", String(viewport.scale))
+        }
         await renderTask.promise
+        if (disposed || !textContainer) return
+        const { TextLayer } = await import("pdfjs-dist/legacy/build/pdf.mjs")
+        if (disposed) return
+        const layer = new TextLayer({
+          textContentSource: pdfPage.streamTextContent(),
+          container: textContainer,
+          viewport,
+        })
+        textLayer = layer
+        await layer.render()
       } catch (error) {
         if (!disposed && !(error instanceof Error && error.name === "RenderingCancelledException")) {
           setLoadError(error instanceof Error ? error.message : String(error))
@@ -194,6 +216,7 @@ function PdfPreview({ filePath, content }: { filePath: string; content: string }
     return () => {
       disposed = true
       renderTask?.cancel()
+      textLayer?.cancel()
     }
   }, [document, page, showText, zoom])
 
@@ -215,7 +238,12 @@ function PdfPreview({ filePath, content }: { filePath: string; content: string }
           <button type="button" className="rounded border px-3 py-1.5 hover:bg-muted" onClick={() => setReloadKey((value) => value + 1)}>{t("preview.reload")}</button>
         </div>
       ) : (
-        <div className="h-full overflow-auto bg-muted/30 p-4"><canvas ref={canvasRef} className="mx-auto bg-white shadow-sm" /></div>
+        <div className="h-full overflow-auto bg-muted/30 p-4">
+          <div className="relative mx-auto w-fit bg-white shadow-sm">
+            <canvas ref={canvasRef} className="block" />
+            <div ref={textLayerRef} className="textLayer" />
+          </div>
+        </div>
       )}
     </div>
   </div>
