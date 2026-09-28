@@ -46,6 +46,8 @@ const MAX_SHELL_GENERATED_FILES: usize = 50;
 const SHELL_OUTPUT_DRAIN_TIMEOUT_SECS: u64 = 1;
 const DEFAULT_ANYTXT_ENDPOINT: &str = "http://127.0.0.1:9920";
 const DEFAULT_ANYTXT_LIMIT: usize = 20;
+const DEFAULT_HISTER_ENDPOINT: &str = "http://127.0.0.1:9091";
+const DEFAULT_HISTER_LIMIT: usize = 10;
 const ANYTXT_LAST_MODIFY_END: i64 = 2_147_483_647;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,6 +98,7 @@ pub struct ToolContext<'a> {
     pub embedding_config: Option<SearchEmbeddingConfig>,
     pub web_search_config: Option<WebSearchConfig>,
     pub anytxt_config: Option<AnyTxtConfig>,
+    pub hister_config: Option<HisterConfig>,
 }
 
 impl ToolRegistry for BuiltinToolRegistry {
@@ -252,6 +255,13 @@ impl ToolRegistry for BuiltinToolRegistry {
                     )
                     .map_err(|err| format!("Failed to serialize anytxt.search result: {err}"))
                 }
+                "hister.search" => {
+                    let query = tool_query(&input, "hister.search")?;
+                    serde_json::to_value(
+                        run_hister_search(query, context.hister_config, tool_top_k(&input)).await?,
+                    )
+                    .map_err(|err| format!("Failed to serialize hister.search result: {err}"))
+                }
                 "deep_research.run" => {
                     let query = tool_query(&input, "deep_research.run")?;
                     serde_json::to_value(json!({
@@ -377,6 +387,26 @@ pub struct AnyTxtConfig {
     pub limit: Option<usize>,
 }
 
+/// Connection settings for a self-hosted Hister instance (browsing history +
+/// document index, https://github.com/asciimoo/hister). Hister is Go/AGPL
+/// and lives outside this Rust/TS codebase, so integration is over its
+/// built-in MCP endpoint (`POST {endpoint}/mcp`) rather than by vendoring
+/// any of its code — see the Phase 0 reuse audit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HisterConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Bearer token, if the Hister instance requires auth (it does by
+    /// default outside of localhost-only setups).
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 impl WebSearchConfig {
     fn resolved(&self) -> Self {
         let provider = self.provider.trim().to_ascii_lowercase();
@@ -490,6 +520,19 @@ pub fn builtin_tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "anytxt.search".to_string(),
             description: "Search files indexed by an AnyTXT JSON-RPC service.".to_string(),
+            effects: vec![ToolEffect::Network, ToolEffect::Read],
+            parameters: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "topK": { "type": "integer", "minimum": 1, "maximum": 10 }
+                },
+                "required": ["query"]
+            })),
+        },
+        ToolSpec {
+            name: "hister.search".to_string(),
+            description: "Search a self-hosted Hister index (captured web pages and browsing history) over its MCP endpoint.".to_string(),
             effects: vec![ToolEffect::Network, ToolEffect::Read],
             parameters: Some(serde_json::json!({
                 "type": "object",
@@ -1311,6 +1354,115 @@ pub async fn run_anytxt_search(
             ))
             .filter(|s| !s.trim().is_empty()),
             score: None,
+            knowledge_context: None,
+        });
+    }
+    Ok(references)
+}
+
+/// Search a self-hosted Hister instance over its native MCP endpoint
+/// (`POST {endpoint}/mcp`, JSON-RPC 2.0 `tools/call` → `search`). Hister
+/// is a separate Go service (see the Phase 0 reuse audit); this treats
+/// it purely as an external tool provider, the same shape as
+/// `run_anytxt_search` above.
+///
+/// Hister wraps every result field in an explicit untrusted-content
+/// envelope (`structuredContent.untrusted_content[].fields`) and asks
+/// callers not to treat returned text as instructions — that warning is
+/// preserved by surfacing the fields as an inert snippet, never
+/// executed or reinterpreted here.
+pub async fn run_hister_search(
+    query: &str,
+    config: Option<HisterConfig>,
+    top_k: usize,
+) -> Result<Vec<AgentReference>, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let config = config.unwrap_or_default();
+    if config.enabled != Some(true) {
+        // Unlike AnyTXT, Hister requires an explicit opt-in: it can surface
+        // personal browsing history, not just files the user chose to index.
+        return Ok(Vec::new());
+    }
+    let endpoint = config
+        .endpoint
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(DEFAULT_HISTER_ENDPOINT)
+        .trim()
+        .trim_end_matches('/');
+    let mcp_url = format!("{endpoint}/mcp");
+    let limit = top_k
+        .clamp(1, 50)
+        .min(config.limit.unwrap_or(DEFAULT_HISTER_LIMIT).clamp(1, 50));
+    let client = crate::proxy::configure_http_client(reqwest::Client::builder())
+        .timeout(std::time::Duration::from_secs(WEB_SEARCH_TIMEOUT_SECS))
+        .build()
+        .map_err(|err| format!("Failed to build Hister client: {err}"))?;
+    let mut request = client.post(&mcp_url).header("Accept", "application/json").json(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "search",
+            "arguments": { "query": query, "limit": limit }
+        }
+    }));
+    if let Some(token) = config.token.as_deref().filter(|t| !t.trim().is_empty()) {
+        request = request.bearer_auth(token);
+    }
+    let response = request.send().await.map_err(|err| {
+        format!("Hister search failed. Check that the Hister server is running at {endpoint}: {err}")
+    })?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|err| format!("Failed to read Hister response: {err}"))?;
+    if !status.is_success() {
+        return Err(format!("Hister HTTP {status}: {}", trim_text(&text, 300)));
+    }
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|_| format!("Hister returned invalid JSON: {}", trim_text(&text, 300)))?;
+    if let Some(error) = value.get("error") {
+        return Err(format!("Hister error: {}", trim_text(&error.to_string(), 300)));
+    }
+    let records = value
+        .pointer("/result/structuredContent/untrusted_content")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut references = Vec::new();
+    for record in records.into_iter().take(limit) {
+        let fields = record.get("fields").cloned().unwrap_or(Value::Null);
+        let title = fields
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("Untitled")
+            .to_string();
+        let url = fields
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if url.is_empty() {
+            continue;
+        }
+        let snippet = fields
+            .get("snippet")
+            .or_else(|| fields.get("text"))
+            .and_then(Value::as_str)
+            .map(|s| trim_text(s, 1200))
+            .filter(|s| !s.trim().is_empty());
+        references.push(AgentReference {
+            title,
+            path: url,
+            kind: "hister".to_string(),
+            snippet,
+            score: fields.get("score").and_then(Value::as_f64),
             knowledge_context: None,
         });
     }
@@ -2883,6 +3035,7 @@ mod tests {
             embedding_config: None,
             web_search_config: None,
             anytxt_config: None,
+            hister_config: None,
         };
         let read = registry
             .execute(
@@ -2913,6 +3066,7 @@ mod tests {
             embedding_config: None,
             web_search_config: None,
             anytxt_config: None,
+            hister_config: None,
         };
         let output = registry
             .execute(

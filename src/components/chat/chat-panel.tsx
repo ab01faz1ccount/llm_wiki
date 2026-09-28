@@ -15,6 +15,7 @@ import { executeIngestWrites } from "@/lib/ingest"
 import { deleteFile, openPathInProject, readFile } from "@/commands/fs"
 import { getFileName, isAbsolutePath, normalizePath } from "@/lib/path-utils"
 import { hasConfiguredAnyTxt } from "@/lib/anytxt-search"
+import { hasConfiguredHister } from "@/lib/hister-search"
 import type { ChatAgentEvent, ChatAgentFileChange, ChatAgentStep, ChatUserInputRequest } from "@/lib/chat-agent-types"
 import type { ChatMessage as LlmChatMessage, ContentBlock } from "@/lib/llm-client"
 import { FilePreview } from "@/components/editor/file-preview"
@@ -86,7 +87,7 @@ interface AvailableAgentSkill {
   source: string
 }
 
-type ContextDetailCategory = "wiki" | "graph" | "web" | "anytxt" | "workspace" | "external"
+type ContextDetailCategory = "wiki" | "graph" | "web" | "anytxt" | "hister" | "workspace" | "external"
 
 interface ContextDetailItem extends MessageReference {
   content: string
@@ -98,6 +99,7 @@ function contextDetailCategory(reference: MessageReference): ContextDetailCatego
   const source = reference.source?.trim().toLowerCase()
   if (source === "graph") return "graph"
   if (source === "anytxt") return "anytxt"
+  if (source === "hister") return "hister"
   if (source === "web") return "web"
   if (reference.kind === "workspace") return "workspace"
   if (reference.kind === "wiki") return "wiki"
@@ -279,6 +281,7 @@ function backendReferenceToMessageReference(ref: BackendAgentReference): Message
   const source =
     isWorkspace ? "Workspace"
       : ref.kind === "anytxt" ? "AnyTXT"
+      : ref.kind === "hister" ? "Hister"
       : ref.kind === "web" ? "Web"
         : ref.kind === "source" ? "Source"
           : ref.kind === "graph" ? "Graph"
@@ -462,6 +465,7 @@ export function ChatPanel() {
   const maxHistoryMessages = useChatStore((s) => s.maxHistoryMessages)
   const useWebSearch = useChatStore((s) => s.useWebSearch)
   const useAnyTxtSearch = useChatStore((s) => s.useAnyTxtSearch)
+  const useHisterSearch = useChatStore((s) => s.useHisterSearch)
   const agentMode = useChatStore((s) => s.agentMode)
   const retrievalMode = useChatStore((s) => s.retrievalMode)
   const selectedSkills = useChatStore((s) => s.selectedSkills)
@@ -469,6 +473,7 @@ export function ChatPanel() {
   const disabledSkills = useChatStore((s) => s.disabledSkills)
   const setUseWebSearch = useChatStore((s) => s.setUseWebSearch)
   const setUseAnyTxtSearch = useChatStore((s) => s.setUseAnyTxtSearch)
+  const setUseHisterSearch = useChatStore((s) => s.setUseHisterSearch)
   const setAgentMode = useChatStore((s) => s.setAgentMode)
   const setRetrievalMode = useChatStore((s) => s.setRetrievalMode)
   const setSelectedSkills = useChatStore((s) => s.setSelectedSkills)
@@ -493,6 +498,7 @@ export function ChatPanel() {
   )
   const searchApiConfig = useWikiStore((s) => s.searchApiConfig)
   const anyTxtAvailable = hasConfiguredAnyTxt(searchApiConfig.anyTxt)
+  const histerAvailable = hasConfiguredHister(searchApiConfig.hister)
   const imageInputAvailable = supportsImageInput(llmConfig)
   const availableContextFiles = useMemo(() => {
     if (!project) return []
@@ -726,6 +732,7 @@ export function ChatPanel() {
       const sendOptions = options ?? {
         useWebSearch: useChatStore.getState().useWebSearch,
         useAnyTxtSearch: useChatStore.getState().useAnyTxtSearch,
+        useHisterSearch: useChatStore.getState().useHisterSearch,
         agentMode: useChatStore.getState().agentMode,
         retrievalMode: useChatStore.getState().retrievalMode,
         skills: useChatStore.getState().selectedSkills,
@@ -998,6 +1005,7 @@ export function ChatPanel() {
                   wiki: true,
                   web: sendOptions.useWebSearch,
                   anytxt: sendOptions.useAnyTxtSearch,
+                  hister: sendOptions.useHisterSearch,
                 },
                 topK: sendOptions.agentMode === "deep" ? 8 : 5,
                 includeContent: sendOptions.agentMode === "deep",
@@ -1076,6 +1084,7 @@ export function ChatPanel() {
               wiki: true,
               web: sendOptions.useWebSearch,
               anytxt: sendOptions.useAnyTxtSearch,
+              hister: sendOptions.useHisterSearch,
             },
             topK: sendOptions.agentMode === "deep" ? 8 : 5,
             includeContent: sendOptions.agentMode === "deep",
@@ -1353,6 +1362,7 @@ export function ChatPanel() {
       await handleSend(resumeMessage, priorUser.images ?? [], {
         useWebSearch: useChatStore.getState().useWebSearch,
         useAnyTxtSearch: useChatStore.getState().useAnyTxtSearch,
+        useHisterSearch: useChatStore.getState().useHisterSearch,
         agentMode: useChatStore.getState().agentMode,
         retrievalMode: useChatStore.getState().retrievalMode,
         skills: useChatStore.getState().selectedSkills,
@@ -1385,6 +1395,7 @@ export function ChatPanel() {
     handleSend(resumeMessage, [], {
       useWebSearch: useChatStore.getState().useWebSearch,
       useAnyTxtSearch: useChatStore.getState().useAnyTxtSearch,
+      useHisterSearch: useChatStore.getState().useHisterSearch,
       agentMode: useChatStore.getState().agentMode,
       retrievalMode: useChatStore.getState().retrievalMode,
       skills: useChatStore.getState().selectedSkills,
@@ -1479,6 +1490,7 @@ export function ChatPanel() {
           isStreaming={activeStreaming}
           useWebSearch={useWebSearch}
           useAnyTxtSearch={useAnyTxtSearch}
+          useHisterSearch={useHisterSearch}
           agentMode={agentMode}
           retrievalMode={retrievalMode}
           availableSkills={availableSkills}
@@ -1487,11 +1499,13 @@ export function ChatPanel() {
           selectedContextFiles={selectedContextFiles}
           onUseWebSearchChange={setUseWebSearch}
           onUseAnyTxtSearchChange={setUseAnyTxtSearch}
+          onUseHisterSearchChange={setUseHisterSearch}
           onAgentModeChange={setAgentMode}
           onRetrievalModeChange={setRetrievalMode}
           onSelectedSkillsChange={setSelectedSkills}
           onSelectedContextFilesChange={setSelectedContextFiles}
           anyTxtAvailable={anyTxtAvailable}
+          histerAvailable={histerAvailable}
           imageInputAvailable={imageInputAvailable}
           placeholder={
             mode === "ingest"
@@ -1850,10 +1864,11 @@ function ContextDetailsPanel({
       graph: t("chat.contextCategoryGraph"),
       web: t("chat.contextCategoryWeb"),
       anytxt: t("chat.contextCategoryAnyTxt"),
+      hister: t("chat.contextCategoryHister"),
       workspace: t("chat.contextCategoryWorkspace"),
       external: t("chat.contextCategoryExternal"),
     }
-    const order: ContextDetailCategory[] = ["wiki", "graph", "web", "anytxt", "workspace", "external"]
+    const order: ContextDetailCategory[] = ["wiki", "graph", "web", "anytxt", "hister", "workspace", "external"]
     return order.flatMap((category) => {
       const group = result.get(category)
       return group ? [[category, labels[category], group] as const] : []

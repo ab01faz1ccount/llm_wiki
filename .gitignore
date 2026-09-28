@@ -52,3 +52,21 @@ pnpm-debug.log*
 
 pdf-text-layer
 pdf-text-layer.patch
+
+reader-db-schema
+reader-db-schema.patch
+
+hister-integration
+hister-integration.patch
+
+pdf-highlights
+pdf-highlights.patch
+
+combined-remaining-features
+combined-remaining-features.patch
+
+hotfix-reader-db-test
+hotfix-reader-db-test.patch
+
+hotfix-agent-tool-options
+hotfix-agent-tool-options.patch

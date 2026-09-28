@@ -12,6 +12,7 @@ import { detectLanguage } from "@/lib/detect-language"
 import { getHtmlLang, getTextDirection } from "@/lib/language-metadata"
 import { useWikiStore } from "@/stores/wiki-store"
 import { MermaidDiagram, unwrapMermaidPre } from "@/components/mermaid-diagram"
+import { rehypeHighlightMarks, type MarkdownHighlightSpec } from "@/lib/markdown-highlight"
 
 interface WikiReaderProps {
   body: string
@@ -27,6 +28,11 @@ interface WikiReaderProps {
    * resolution.
    */
   filePath?: string
+  /** Saved highlights to render as <mark> spans (best-effort text match —
+   * see rehypeHighlightMarks). Omit to render with no highlights at all. */
+  highlights?: MarkdownHighlightSpec[]
+  /** Called with a highlight's id when its <mark> is clicked. */
+  onHighlightClick?: (highlightId: string) => void
 }
 
 /**
@@ -41,7 +47,7 @@ interface WikiReaderProps {
  * against the project's wiki tree and routed to the wiki preview,
  * giving the user single-click navigation between pages.
  */
-export function WikiReader({ body, sourceBody, sourceOffset = 0, filePath }: WikiReaderProps) {
+export function WikiReader({ body, sourceBody, sourceOffset = 0, filePath, highlights, onHighlightClick }: WikiReaderProps) {
   const project = useWikiStore((s) => s.project)
   const projectPathIndex = useWikiStore((s) => s.projectPathIndex)
   const openPathInPreview = useWikiStore((s) => s.openPathInPreview)
@@ -102,16 +108,29 @@ export function WikiReader({ body, sourceBody, sourceOffset = 0, filePath }: Wik
     if (path) openPathInPreview(path)
   }
 
+  const rehypePlugins = useMemo(() => {
+    const plugins: NonNullable<Parameters<typeof ReactMarkdown>[0]["rehypePlugins"]> = [rehypeKatex]
+    if (highlights && highlights.length > 0) plugins.push([rehypeHighlightMarks, highlights])
+    return plugins
+  }, [highlights])
+
+  function handleContainerClick(event: React.MouseEvent<HTMLDivElement>) {
+    if (!onHighlightClick) return
+    const mark = (event.target as HTMLElement).closest<HTMLElement>("mark[data-highlight-id]")
+    if (mark?.dataset.highlightId) onHighlightClick(mark.dataset.highlightId)
+  }
+
   return (
     <div
       className="prose prose-invert min-w-0 max-w-none"
       dir={direction}
       lang={htmlLang}
       style={{ textAlign: "start" }}
+      onClick={handleContainerClick}
     >
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[rehypeKatex]}
+        rehypePlugins={rehypePlugins}
         components={{
           p: ({ node, children, ...props }) => <p {...sourceAttrs(node)} {...props}>{children}</p>,
           li: ({ node, children, ...props }) => <li {...sourceAttrs(node)} {...props}>{children}</li>,

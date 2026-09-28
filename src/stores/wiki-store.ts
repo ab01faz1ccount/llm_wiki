@@ -113,6 +113,13 @@ export interface AnyTxtConfig {
   limit?: number
 }
 
+export interface HisterConfig {
+  enabled?: boolean
+  endpoint?: string
+  token?: string
+  limit?: number
+}
+
 interface SearchApiConfig {
   provider: SearchProvider
   apiKey: string
@@ -123,6 +130,7 @@ interface SearchApiConfig {
   providerConfigs?: SearchProviderConfigs
   deepResearchSource?: DeepResearchSource
   anyTxt?: AnyTxtConfig
+  hister?: HisterConfig
 }
 
 interface EmbeddingConfig {
@@ -587,6 +595,12 @@ export const useWikiStore = create<WikiState>((set) => ({
       filterDir: "",
       filterExt: "*",
       limit: 20,
+    },
+    hister: {
+      enabled: false,
+      endpoint: "http://127.0.0.1:9091",
+      token: "",
+      limit: 10,
     },
   },
 

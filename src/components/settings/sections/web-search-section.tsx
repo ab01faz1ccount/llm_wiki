@@ -6,12 +6,14 @@ import { Label } from "@/components/ui/label"
 import {
   useWikiStore,
   type AnyTxtConfig,
+  type HisterConfig,
   type DeepResearchSource,
   type SearchApiConfig,
   type SearchProvider,
   type SearchProviderOverride,
 } from "@/stores/wiki-store"
 import { normalizeAnyTxtConfig } from "@/lib/anytxt-search"
+import { normalizeHisterConfig } from "@/lib/hister-search"
 import {
   SEARXNG_CATEGORY_OPTIONS,
   SERPAPI_ENGINE_OPTIONS,
@@ -79,6 +81,7 @@ export function WebSearchSection() {
   const anyTxtConfig = normalizeAnyTxtConfig(resolvedConfig.anyTxt)
   const anyTxtFilterDir = resolvedConfig.anyTxt?.filterDir ?? ""
   const showBroadAnyTxtWarning = isBroadAnyTxtFilterDir(anyTxtFilterDir)
+  const histerConfig = normalizeHisterConfig(resolvedConfig.hister)
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
   const [savedId, setSavedId] = useState<string | null>(null)
   const [testStatus, setTestStatus] = useState<Record<string, { state: "testing" | "ok" | "warning" | "error"; message: string }>>({})
@@ -161,6 +164,19 @@ export function WebSearchSection() {
     persist(next).catch(() => {})
     setSavedId("anytxt")
     setTimeout(() => setSavedId((cur) => (cur === "anytxt" ? null : cur)), 1500)
+  }
+
+  function updateHister(patch: HisterConfig) {
+    const next = resolveSearchConfig({
+      ...resolvedConfig,
+      hister: {
+        ...histerConfig,
+        ...patch,
+      },
+    })
+    persist(next).catch(() => {})
+    setSavedId("hister")
+    setTimeout(() => setSavedId((cur) => (cur === "hister" ? null : cur)), 1500)
   }
 
   return (
@@ -285,6 +301,81 @@ export function WebSearchSection() {
         </div>
         <p className="text-xs text-muted-foreground">
           {t("settings.sections.webSearch.anyTxtHint")}
+        </p>
+      </div>
+
+      <div className="space-y-3 rounded-lg border p-3">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <Label>{t("settings.sections.webSearch.histerTitle")}</Label>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t("settings.sections.webSearch.histerDescription")}
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            {savedId === "hister" && (
+              <span className="text-[10px] text-emerald-600">
+                {t("settings.sections.webSearch.savedBadge")}
+              </span>
+            )}
+            {histerConfig.enabled && (
+              <span className="rounded-full bg-primary/20 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                {t("settings.sections.webSearch.activeBadge")}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={() => updateHister({ enabled: !histerConfig.enabled })}
+              className={`relative inline-flex h-5 w-9 items-center rounded-full border transition-colors ${
+                histerConfig.enabled
+                  ? "border-primary bg-primary"
+                  : "border-muted-foreground/30 bg-muted-foreground/20 hover:bg-muted-foreground/30"
+              }`}
+              aria-label={histerConfig.enabled ? t("settings.sections.webSearch.deactivate") : t("settings.sections.webSearch.activate")}
+            >
+              <span
+                className={`inline-block h-3.5 w-3.5 rounded-full bg-white shadow-sm ring-1 ring-black/10 transition-transform ${
+                  histerConfig.enabled ? "translate-x-4" : "translate-x-0.5"
+                }`}
+              />
+            </button>
+          </div>
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="space-y-2">
+            <Label>{t("settings.sections.webSearch.histerEndpoint")}</Label>
+            <Input
+              value={histerConfig.endpoint}
+              onChange={(e) => updateHister({ endpoint: e.target.value })}
+              placeholder="http://127.0.0.1:9091"
+            />
+          </div>
+          <div className="space-y-2">
+            <Label>{t("settings.sections.webSearch.histerLimit")}</Label>
+            <Input
+              type="number"
+              min={1}
+              max={50}
+              value={histerConfig.limit}
+              onChange={(e) => {
+                const value = e.target.value.trim()
+                updateHister({ limit: value ? Number(value) : undefined })
+              }}
+              placeholder="10"
+            />
+          </div>
+          <div className="space-y-2 md:col-span-2">
+            <Label>{t("settings.sections.webSearch.histerToken")}</Label>
+            <Input
+              type="password"
+              value={histerConfig.token}
+              onChange={(e) => updateHister({ token: e.target.value })}
+              placeholder={t("settings.sections.webSearch.histerTokenPlaceholder")}
+            />
+          </div>
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {t("settings.sections.webSearch.histerHint")}
         </p>
       </div>
 

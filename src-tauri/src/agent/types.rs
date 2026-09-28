@@ -43,6 +43,8 @@ pub struct AgentToolOptions {
     pub web: bool,
     #[serde(default)]
     pub anytxt: bool,
+    #[serde(default)]
+    pub hister: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +83,7 @@ impl Default for AgentToolOptions {
             wiki: true,
             web: false,
             anytxt: false,
+            hister: false,
         }
     }
 }

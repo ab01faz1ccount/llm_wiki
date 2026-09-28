@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react"
-import { BrainCircuit, ChevronDown, FileSearch, FileText, Globe2, ImagePlus, Send, Sparkles, Square, X } from "lucide-react"
+import { BrainCircuit, ChevronDown, FileSearch, FileText, Globe2, History, ImagePlus, Send, Sparkles, Square, X } from "lucide-react"
 import { useTranslation } from "react-i18next"
 import { Button } from "@/components/ui/button"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
@@ -18,6 +18,7 @@ import {
 export interface ChatSendOptions {
   useWebSearch: boolean
   useAnyTxtSearch: boolean
+  useHisterSearch: boolean
   agentMode: ChatAgentMode
   retrievalMode: ChatRetrievalMode
   skills: string[]
@@ -135,6 +136,7 @@ interface ChatInputProps {
   isStreaming: boolean
   useWebSearch: boolean
   useAnyTxtSearch: boolean
+  useHisterSearch: boolean
   agentMode: ChatAgentMode
   retrievalMode: ChatRetrievalMode
   availableSkills: ChatSkillOption[]
@@ -143,11 +145,13 @@ interface ChatInputProps {
   selectedContextFiles: string[]
   onUseWebSearchChange: (enabled: boolean) => void
   onUseAnyTxtSearchChange: (enabled: boolean) => void
+  onUseHisterSearchChange: (enabled: boolean) => void
   onAgentModeChange: (mode: ChatAgentMode) => void
   onRetrievalModeChange: (mode: ChatRetrievalMode) => void
   onSelectedSkillsChange: (skills: string[]) => void
   onSelectedContextFilesChange: (paths: string[]) => void
   anyTxtAvailable?: boolean
+  histerAvailable?: boolean
   imageInputAvailable?: boolean
   placeholder?: string
 }
@@ -158,6 +162,7 @@ export function ChatInput({
   isStreaming,
   useWebSearch,
   useAnyTxtSearch,
+  useHisterSearch,
   agentMode,
   retrievalMode,
   availableSkills,
@@ -166,11 +171,13 @@ export function ChatInput({
   selectedContextFiles,
   onUseWebSearchChange,
   onUseAnyTxtSearchChange,
+  onUseHisterSearchChange,
   onAgentModeChange,
   onRetrievalModeChange,
   onSelectedSkillsChange,
   onSelectedContextFilesChange,
   anyTxtAvailable = true,
+  histerAvailable = true,
   imageInputAvailable = true,
   placeholder,
 }: ChatInputProps) {
@@ -238,6 +245,10 @@ export function ChatInput({
   useEffect(() => {
     if (!anyTxtAvailable && useAnyTxtSearch) onUseAnyTxtSearchChange(false)
   }, [anyTxtAvailable, onUseAnyTxtSearchChange, useAnyTxtSearch])
+
+  useEffect(() => {
+    if (!histerAvailable && useHisterSearch) onUseHisterSearchChange(false)
+  }, [histerAvailable, onUseHisterSearchChange, useHisterSearch])
 
   useEffect(() => {
     setSlashSkillIndex(0)
@@ -374,6 +385,7 @@ export function ChatInput({
     onSend(trimmed, images, {
       useWebSearch,
       useAnyTxtSearch,
+      useHisterSearch,
       agentMode,
       retrievalMode,
       skills: selectedSkills,
@@ -747,6 +759,36 @@ export function ChatInput({
                 {!anyTxtAvailable && (
                   <TooltipContent side="top" className="max-w-64 whitespace-normal leading-relaxed">
                     {t("chat.enableAnyTxtInSettings")}
+                  </TooltipContent>
+                )}
+              </Tooltip>
+            </TooltipProvider>
+            <TooltipProvider delay={0}>
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <span className="inline-flex" />
+                  }
+                >
+                  <button
+                    type="button"
+                    aria-pressed={useHisterSearch}
+                    onClick={() => onUseHisterSearchChange(!useHisterSearch)}
+                    disabled={isStreaming || !histerAvailable}
+                    className={searchToggleClass(useHisterSearch)}
+                  >
+                    <History className="h-3.5 w-3.5" />
+                    {t("chat.useHisterSearch")}
+                    <span
+                      className={`ml-0.5 h-1.5 w-1.5 rounded-full ${
+                        useHisterSearch ? "bg-emerald-500" : "bg-muted-foreground/30"
+                      }`}
+                    />
+                  </button>
+                </TooltipTrigger>
+                {!histerAvailable && (
+                  <TooltipContent side="top" className="max-w-64 whitespace-normal leading-relaxed">
+                    {t("chat.enableHisterInSettings")}
                   </TooltipContent>
                 )}
               </Tooltip>

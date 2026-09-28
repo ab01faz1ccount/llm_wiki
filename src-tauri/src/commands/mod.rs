@@ -10,5 +10,6 @@ pub mod fs;
 pub mod page_embedding;
 pub mod project;
 pub mod project_maintenance;
+pub mod reader_db;
 pub mod search;
 pub mod vectorstore;

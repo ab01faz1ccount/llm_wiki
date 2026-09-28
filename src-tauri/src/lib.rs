@@ -34,6 +34,7 @@ struct AgentRuntimeConfig {
     llm: Option<agent::provider::LlmConfig>,
     web_search: Option<agent::tools::WebSearchConfig>,
     anytxt: Option<agent::tools::AnyTxtConfig>,
+    hister: Option<agent::tools::HisterConfig>,
 }
 
 #[tauri::command]
@@ -111,6 +112,7 @@ async fn agent_start_turn(
         runtime_config.llm,
         runtime_config.web_search,
         runtime_config.anytxt,
+        runtime_config.hister,
     );
     let user_message = request.message.clone();
     let persist_session = request.persist_session;
@@ -197,6 +199,7 @@ async fn agent_start_turn_stream(
         runtime_config.llm,
         runtime_config.web_search,
         runtime_config.anytxt,
+        runtime_config.hister,
     );
     let app_for_task = app.clone();
     let project_for_task = project.clone();
@@ -430,6 +433,11 @@ fn load_agent_runtime_config(app: &tauri::AppHandle) -> AgentRuntimeConfig {
             .and_then(|value| value.get("anyTxt"))
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok()),
+        hister: parsed
+            .get("searchApiConfig")
+            .and_then(|value| value.get("hister"))
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
     }
 }
 
@@ -659,6 +667,7 @@ pub fn run() {
             commands::search::get_page_links,
             commands::external_search::web_search,
             commands::external_search::anytxt_search,
+            commands::external_search::hister_search,
             clip_server_status,
             api_server_status,
             api_server_reload_config,
@@ -669,6 +678,19 @@ pub fn run() {
             agent_list_sessions,
             agent::skills::agent_list_skills,
             mcp_server_entry_path,
+            commands::reader_db::reader_get_reading_state,
+            commands::reader_db::reader_set_reading_state,
+            commands::reader_db::reader_list_highlights,
+            commands::reader_db::reader_add_highlight,
+            commands::reader_db::reader_update_highlight_color,
+            commands::reader_db::reader_delete_highlight,
+            commands::reader_db::reader_list_notes,
+            commands::reader_db::reader_add_note,
+            commands::reader_db::reader_update_note,
+            commands::reader_db::reader_delete_note,
+            commands::reader_db::reader_list_bookmarks,
+            commands::reader_db::reader_add_bookmark,
+            commands::reader_db::reader_delete_bookmark,
             commands::vectorstore::vector_upsert,
             commands::vectorstore::vector_search,
             commands::vectorstore::vector_delete,

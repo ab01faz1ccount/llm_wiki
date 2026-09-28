@@ -20,7 +20,7 @@ use super::permissions::{AgentCapability, PermissionPolicy};
 use super::provider::{AgentLlmProvider, LlmClient, LlmConfig};
 use super::router::route_query;
 use super::skills::{load_project_skills, AgentSkill};
-use super::tools::{self, AnyTxtConfig, ToolRegistry, WebSearchConfig};
+use super::tools::{self, AnyTxtConfig, HisterConfig, ToolRegistry, WebSearchConfig};
 use super::types::{
     AgentChatRequest, AgentChatResponse, AgentMode, AgentReference, AgentRetrievalMode,
     AgentSkillMode, AgentToolEvent, AgentUsage, AgentUserInputField, AgentUserInputOption,
@@ -54,6 +54,7 @@ pub struct AgentRuntime {
     llm_config: Option<LlmConfig>,
     web_search_config: Option<WebSearchConfig>,
     anytxt_config: Option<AnyTxtConfig>,
+    hister_config: Option<HisterConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -135,6 +136,7 @@ impl AgentRuntime {
         llm_config: Option<LlmConfig>,
         web_search_config: Option<WebSearchConfig>,
         anytxt_config: Option<AnyTxtConfig>,
+        hister_config: Option<HisterConfig>,
     ) -> Self {
         Self {
             project_id: project_id.into(),
@@ -143,6 +145,7 @@ impl AgentRuntime {
             llm_config,
             web_search_config,
             anytxt_config,
+            hister_config,
         }
     }
 
@@ -238,6 +241,17 @@ impl AgentRuntime {
                 detail: Some("AnyTXT search is enabled for this turn. Router decides whether to execute it immediately.".to_string()),
             });
         }
+        // Hister has no dedicated AgentCapability of its own yet (unlike
+        // AnyTXT's SearchAnyTxt) — it requests the same generic Network
+        // capability the execution block already requires below.
+        if request.tools.hister && request.retrieval_mode != AgentRetrievalMode::Faithful {
+            permission_policy.require(AgentCapability::Network)?;
+            tool_emit_event(&mut tool_events, &mut events, &event_sink, AgentToolEvent {
+                tool: "hister.search".to_string(),
+                status: "available".to_string(),
+                detail: Some("Hister search is enabled for this turn. Router decides whether to execute it immediately.".to_string()),
+            });
+        }
 
         let mut retrieval_parts = Vec::new();
         let tool_registry = tools::BuiltinToolRegistry::default();
@@ -325,8 +339,20 @@ impl AgentRuntime {
             && (should_include_sources
                 || planned_has("anytxt.search")
                 || matches!(request.mode, AgentMode::Deep));
+        // Both the per-turn checkbox (request.tools.hister — off by
+        // default, since Hister can surface personal browsing history,
+        // not just indexed files) and the settings-level connector must
+        // be enabled.
+        let should_run_hister = request.tools.hister
+            && self
+                .hister_config
+                .as_ref()
+                .is_some_and(|cfg| cfg.enabled == Some(true))
+            && (should_include_sources
+                || planned_has("hister.search")
+                || matches!(request.mode, AgentMode::Deep));
         let deep_research = matches!(request.mode, AgentMode::Deep)
-            && (should_run_web || should_run_anytxt || should_include_sources);
+            && (should_run_web || should_run_anytxt || should_run_hister || should_include_sources);
         let shell_call = if skills.is_empty() {
             None
         } else if let Some(command) = request
@@ -1120,6 +1146,96 @@ impl AgentRuntime {
             }
         }
 
+        if should_run_hister {
+            check_cancel(cancellation.as_ref())?;
+            permission_policy.require(AgentCapability::Network)?;
+            let hister_query = planned_queries
+                .get("hister.search")
+                .map(String::as_str)
+                .unwrap_or(message);
+            tool_emit_event(
+                &mut tool_events,
+                &mut events,
+                &event_sink,
+                AgentToolEvent {
+                    tool: "hister.search".to_string(),
+                    status: "started".to_string(),
+                    detail: Some(hister_query.to_string()),
+                },
+            );
+            emit_event(
+                &mut events,
+                &event_sink,
+                AgentEvent::tool_start("hister.search", Some(hister_query.to_string())),
+            );
+            match execute_tool_with_cancellation(
+                tool_registry.execute(
+                    "hister.search",
+                    serde_json::json!({
+                        "query": hister_query,
+                        "topK": request
+                            .top_k
+                            .unwrap_or(DEFAULT_CHAT_SEARCH_RESULTS)
+                            .clamp(1, MAX_CHAT_SEARCH_RESULTS)
+                    }),
+                    self.tool_context(),
+                ),
+                cancellation.as_ref(),
+            )
+            .await
+            .and_then(|value| {
+                serde_json::from_value::<Vec<AgentReference>>(value)
+                    .map_err(|err| format!("Invalid hister.search result: {err}"))
+            }) {
+                Ok(hister_refs) => {
+                    check_cancel(cancellation.as_ref())?;
+                    for reference in &hister_refs {
+                        emit_event(
+                            &mut events,
+                            &event_sink,
+                            AgentEvent::ReferenceAdded {
+                                reference: reference.clone(),
+                            },
+                        );
+                    }
+                    let count = hister_refs.len();
+                    references.extend(hister_refs);
+                    tool_emit_event(
+                        &mut tool_events,
+                        &mut events,
+                        &event_sink,
+                        AgentToolEvent {
+                            tool: "hister.search".to_string(),
+                            status: "completed".to_string(),
+                            detail: Some(format!("{count} result(s)")),
+                        },
+                    );
+                    emit_event(
+                        &mut events,
+                        &event_sink,
+                        AgentEvent::tool_end("hister.search", Some(format!("{count} result(s)"))),
+                    );
+                }
+                Err(err) => {
+                    tool_emit_event(
+                        &mut tool_events,
+                        &mut events,
+                        &event_sink,
+                        AgentToolEvent {
+                            tool: "hister.search".to_string(),
+                            status: "failed".to_string(),
+                            detail: Some(err.clone()),
+                        },
+                    );
+                    emit_event(
+                        &mut events,
+                        &event_sink,
+                        AgentEvent::tool_end("hister.search", Some(format!("failed: {err}"))),
+                    );
+                }
+            }
+        }
+
         if deep_research {
             tool_emit_event(
                 &mut tool_events,
@@ -1142,8 +1258,8 @@ impl AgentRuntime {
         }
 
         if retrieval_parts.is_empty() {
-            if !request.tools.wiki && !request.tools.web && !request.tools.anytxt {
-                retrieval_parts.push("No Agent tools were enabled for this request. Enable wiki, web, or AnyTXT tools to let the backend Agent retrieve supporting context.".to_string());
+            if !request.tools.wiki && !request.tools.web && !request.tools.anytxt && !request.tools.hister {
+                retrieval_parts.push("No Agent tools were enabled for this request. Enable wiki, web, AnyTXT, or Hister tools to let the backend Agent retrieve supporting context.".to_string());
             } else {
                 retrieval_parts.push(
                     "No Agent tools ran before generation. Available tools were exposed as model hints."
@@ -2424,6 +2540,7 @@ impl AgentRuntime {
             embedding_config: self.embedding_config.clone(),
             web_search_config: self.web_search_config.clone(),
             anytxt_config: self.anytxt_config.clone(),
+            hister_config: self.hister_config.clone(),
         }
     }
 
@@ -2459,6 +2576,9 @@ impl AgentRuntime {
         }
         if tools.anytxt {
             available.push("anytxt.search");
+        }
+        if tools.hister {
+            available.push("hister.search");
         }
         if skills_enabled {
             available.push("skill.read_file");
@@ -2784,7 +2904,7 @@ fn should_plan_tools_with_model(
     if matches!(mode, AgentMode::Fast) {
         return false;
     }
-    let has_available_tool = tools.wiki || tools.web || tools.anytxt || skills_enabled;
+    let has_available_tool = tools.wiki || tools.web || tools.anytxt || tools.hister || skills_enabled;
     !message.trim().is_empty() && has_available_tool
 }
 
@@ -3049,6 +3169,9 @@ fn build_agent_loop_user(
     }
     if request.tools.anytxt && request.retrieval_mode != AgentRetrievalMode::Faithful {
         out.push_str("- anytxt.search: search files indexed by AnyTXT.\n");
+    }
+    if request.tools.hister && request.retrieval_mode != AgentRetrievalMode::Faithful {
+        out.push_str("- hister.search: search a self-hosted Hister index (captured web pages and browsing history).\n");
     }
     if !skills.is_empty() {
         out.push_str("- skill.read_file: read a Markdown/reference file from an active skill directory by relative path. Prefer this over shell.exec for skill references.\n");
@@ -3579,6 +3702,12 @@ fn require_tool_permission(
             }
             permission_policy.require(AgentCapability::Network)
         }
+        "hister.search" => {
+            if !request.tools.hister {
+                return Err("hister.search is disabled for this turn".to_string());
+            }
+            permission_policy.require(AgentCapability::Network)
+        }
         "deep_research.run" => Err(
             "deep_research.run is not available in the loop executor; use web.search, anytxt.search, source.search, and wiki.search directly"
                 .to_string(),
@@ -4048,6 +4177,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let response = runtime
             .run_once(AgentChatRequest {
@@ -4058,6 +4188,7 @@ mod tests {
                     wiki: true,
                     web: false,
                     anytxt: false,
+                    hister: false,
                 },
                 top_k: Some(3),
                 include_content: Some(false),
@@ -4089,6 +4220,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let error = runtime
@@ -4100,6 +4232,7 @@ mod tests {
                     wiki: true,
                     web: false,
                     anytxt: false,
+                    hister: false,
                 },
                 ..Default::default()
             })
@@ -4136,6 +4269,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let error = runtime
             .run_once(AgentChatRequest {
@@ -4146,6 +4280,7 @@ mod tests {
                     wiki: true,
                     web: false,
                     anytxt: false,
+                    hister: false,
                 },
                 top_k: Some(3),
                 include_content: Some(false),
@@ -4166,6 +4301,7 @@ mod tests {
         let runtime = AgentRuntime::new(
             "project-1",
             project.to_string_lossy(),
+            None,
             None,
             None,
             None,
@@ -4254,6 +4390,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let error = runtime
             .run_once(AgentChatRequest {
@@ -4264,6 +4401,7 @@ mod tests {
                     wiki: false,
                     web: false,
                     anytxt: false,
+                    hister: false,
                 },
                 top_k: None,
                 include_content: None,
@@ -4298,6 +4436,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let error = runtime
             .run_once(AgentChatRequest {
@@ -4308,6 +4447,7 @@ mod tests {
                     wiki: true,
                     web: true,
                     anytxt: false,
+                    hister: false,
                 },
                 top_k: Some(3),
                 include_content: Some(false),
@@ -4339,6 +4479,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let response = runtime
             .run_once(AgentChatRequest {
@@ -4349,6 +4490,7 @@ mod tests {
                     wiki: true,
                     web: true,
                     anytxt: false,
+                    hister: false,
                 },
                 top_k: Some(3),
                 include_content: Some(false),
@@ -4380,6 +4522,7 @@ mod tests {
         let runtime = AgentRuntime::new(
             "project-1",
             project.to_string_lossy(),
+            None,
             None,
             None,
             None,
@@ -4426,6 +4569,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let response = runtime
             .run_once(AgentChatRequest {
@@ -4459,6 +4603,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let captured_events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink_events = Arc::clone(&captured_events);
@@ -4472,6 +4617,7 @@ mod tests {
                         wiki: false,
                         web: false,
                         anytxt: false,
+                        hister: false,
                     },
                     top_k: None,
                     include_content: None,
@@ -4507,6 +4653,7 @@ mod tests {
         let runtime = AgentRuntime::new(
             "project-1",
             project.to_string_lossy(),
+            None,
             None,
             None,
             None,
@@ -4625,6 +4772,7 @@ mod tests {
             wiki: true,
             web: false,
             anytxt: false,
+            hister: false,
         };
         assert!(should_plan_tools_with_model(
             "你现在有哪些 skill 可以使用？",
@@ -4663,6 +4811,7 @@ mod tests {
                 wiki: false,
                 web: false,
                 anytxt: false,
+                hister: false,
             },
             false,
         ));
@@ -4949,6 +5098,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let action = AgentLoopAction {
             action: "tool".to_string(),
@@ -5176,6 +5326,7 @@ mod tests {
                 wiki: true,
                 web: false,
                 anytxt: false,
+                hister: false,
             },
             ..AgentChatRequest::default()
         };
@@ -5198,6 +5349,7 @@ mod tests {
                 wiki: true,
                 web: true,
                 anytxt: true,
+                hister: false,
             },
             ..AgentChatRequest::default()
         };
@@ -5527,6 +5679,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         let mut references = Vec::new();
         let mut events = Vec::new();
@@ -5565,6 +5718,7 @@ mod tests {
         let runtime = AgentRuntime::new(
             "project-1",
             project.to_string_lossy(),
+            None,
             None,
             None,
             None,
@@ -5670,6 +5824,7 @@ mod tests {
             wiki: true,
             web: false,
             anytxt: false,
+            hister: false,
         };
         assert!(should_fallback_wiki_search(true, &tools, true));
         assert!(!should_fallback_wiki_search(false, &tools, true));
@@ -5680,6 +5835,7 @@ mod tests {
                 wiki: false,
                 web: false,
                 anytxt: false,
+                hister: false,
             },
             true,
         ));

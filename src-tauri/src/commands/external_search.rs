@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::agent::tools::{run_anytxt_search, run_web_search, AnyTxtConfig, WebSearchConfig};
+use crate::agent::tools::{run_anytxt_search, run_hister_search, run_web_search, AnyTxtConfig, HisterConfig, WebSearchConfig};
 use crate::panic_guard::run_guarded_async;
 
 /// Frontend-facing search result shape. The Rust Agent uses
@@ -52,6 +52,33 @@ pub async fn anytxt_search(
                 url: file_url_for_path(&item.path),
                 snippet: item.snippet.unwrap_or_default(),
                 source: "AnyTXT".to_string(),
+            })
+            .collect())
+    })
+    .await
+}
+
+/// Standalone command for the settings "Test" button — same shape as
+/// `anytxt_search` above. Note this bypasses the per-turn
+/// `AgentToolOptions.hister` and `request.tools.hister` checks entirely
+/// (there is no request/turn here); those only gate the Agent's own use
+/// of `hister.search` in `agent::runtime`. Callers still need a config
+/// with `enabled: true`, same as `run_hister_search` itself requires.
+#[tauri::command]
+pub async fn hister_search(
+    query: String,
+    config: HisterConfig,
+    max_results: Option<usize>,
+) -> Result<Vec<ExternalSearchResult>, String> {
+    run_guarded_async("hister_search", async move {
+        let references = run_hister_search(&query, Some(config), max_results.unwrap_or(10)).await?;
+        Ok(references
+            .into_iter()
+            .map(|item| ExternalSearchResult {
+                title: item.title,
+                url: item.path,
+                snippet: item.snippet.unwrap_or_default(),
+                source: "Hister".to_string(),
             })
             .collect())
     })

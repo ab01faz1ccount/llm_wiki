@@ -1933,6 +1933,7 @@ fn prepare_chat(
         runtime_config.llm,
         runtime_config.web_search,
         runtime_config.anytxt,
+        runtime_config.hister,
     );
     let user_message_for_session = req.message.clone();
     let persist_session = req.persist_session;
@@ -2245,6 +2246,7 @@ struct AgentRuntimeConfig {
     llm: Option<agent::provider::LlmConfig>,
     web_search: Option<agent::tools::WebSearchConfig>,
     anytxt: Option<agent::tools::AnyTxtConfig>,
+    hister: Option<agent::tools::HisterConfig>,
 }
 
 fn project_llm_config(parsed: &Value, project_id: &str) -> Option<agent::provider::LlmConfig> {
@@ -2349,6 +2351,11 @@ fn load_agent_runtime_config(app: &AppHandle, project_id: Option<&str>) -> Agent
         anytxt: parsed
             .get("searchApiConfig")
             .and_then(|value| value.get("anyTxt"))
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
+        hister: parsed
+            .get("searchApiConfig")
+            .and_then(|value| value.get("hister"))
             .cloned()
             .and_then(|value| serde_json::from_value(value).ok()),
     }

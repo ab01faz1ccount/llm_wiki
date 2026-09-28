@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState, type ReactElement } from "react"
 import { convertFileSrc } from "@tauri-apps/api/core"
 import { openPath } from "@tauri-apps/plugin-opener"
 import ReactMarkdown from "react-markdown"
@@ -20,6 +20,7 @@ import {
   Maximize2,
   Minus,
   Plus,
+  StickyNote,
   X,
 } from "lucide-react"
 import { useTranslation } from "react-i18next"
@@ -40,6 +41,9 @@ import { getHtmlLang, getTextDirection } from "@/lib/language-metadata"
 import { parseFrontmatter } from "@/lib/frontmatter"
 import { FrontmatterPanel } from "@/components/editor/frontmatter-panel"
 import { useWikiStore } from "@/stores/wiki-store"
+import { sourceIdentityForPath } from "@/lib/source-identity"
+import { addHighlight, deleteHighlight, getReadingState, listHighlights, setReadingState, type Highlight } from "@/lib/reader-db"
+import { ReaderSidePanel } from "@/components/reader/reader-side-panel"
 import { MermaidDiagram, unwrapMermaidPre } from "@/components/mermaid-diagram"
 import { FileHistoryButton } from "@/components/editor/file-history-panel"
 
@@ -47,6 +51,25 @@ interface FilePreviewProps {
   filePath: string
   textContent: string
 }
+
+/** A selection rectangle stored as a fraction of the page's rendered
+ * width/height, not absolute pixels — the page container always fills
+ * 100% of itself regardless of zoom, so percentages stay correct across
+ * zoom changes without any recalculation. */
+interface NormalizedRect {
+  xPct: number
+  yPct: number
+  wPct: number
+  hPct: number
+}
+
+const HIGHLIGHT_COLORS: Record<string, string> = {
+  yellow: "rgba(250, 204, 21, 0.45)",
+  green: "rgba(74, 222, 128, 0.45)",
+  blue: "rgba(96, 165, 250, 0.45)",
+  pink: "rgba(244, 114, 182, 0.45)",
+}
+const DEFAULT_HIGHLIGHT_COLOR = "yellow"
 
 export function FilePreview({ filePath, textContent }: FilePreviewProps) {
   return <div className="relative h-full min-h-0">
@@ -88,6 +111,9 @@ function FilePreviewContent({ filePath, textContent }: FilePreviewProps) {
     case "text":
       return <TextPreview filePath={filePath} content={textContent} label="Text" />
     case "document":
+      if (extension === "epub") {
+        return <EpubPreview filePath={filePath} />
+      }
       if (isExtractedTextPreviewFile(filePath)) {
         return <TextPreview filePath={filePath} content={textContent} label={extractedTextLabel(filePath)} />
       }
@@ -109,6 +135,23 @@ function PdfPreview({ filePath, content }: { filePath: string; content: string }
   const [loading, setLoading] = useState(true)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const textLayerRef = useRef<HTMLDivElement | null>(null)
+  const pageContainerRef = useRef<HTMLDivElement | null>(null)
+  const project = useWikiStore((state) => state.project)
+  const sourceIdentity = useMemo(
+    () => (project ? sourceIdentityForPath(project.path, filePath) : null),
+    [project, filePath],
+  )
+  const [highlights, setHighlights] = useState<Highlight[]>([])
+  const [pendingHighlight, setPendingHighlight] = useState<{
+    rects: NormalizedRect[]
+    text: string
+    prefix: string
+    suffix: string
+    anchorXPct: number
+    anchorYPct: number
+  } | null>(null)
+  const [panelOpen, setPanelOpen] = useState(false)
+  const [prefillHighlightId, setPrefillHighlightId] = useState<string | null>(null)
 
   useEffect(() => {
     let disposed = false
@@ -220,13 +263,147 @@ function PdfPreview({ filePath, content }: { filePath: string; content: string }
     }
   }, [document, page, showText, zoom])
 
+  useEffect(() => {
+    if (!project || !sourceIdentity) {
+      setHighlights([])
+      return
+    }
+    let disposed = false
+    void listHighlights(project.path, sourceIdentity)
+      .then((items) => {
+        if (!disposed) setHighlights(items)
+      })
+      .catch(() => {
+        if (!disposed) setHighlights([])
+      })
+    return () => {
+      disposed = true
+    }
+  }, [project, sourceIdentity])
+
+  useEffect(() => {
+    setPendingHighlight(null)
+  }, [page, zoom])
+
+  const restoredPageForRef = useRef<string | null>(null)
+
+  // Restore the last-read page once per document, before the save effect
+  // below starts persisting page changes (guarded by the same ref so a
+  // save can't race ahead of the restore and overwrite it with page 1).
+  useEffect(() => {
+    if (!project || !sourceIdentity || pageCount <= 0) return
+    if (restoredPageForRef.current === sourceIdentity) return
+    restoredPageForRef.current = sourceIdentity
+    void getReadingState(project.path, sourceIdentity)
+      .then((state) => {
+        if (state?.page && state.page >= 1 && state.page <= pageCount) {
+          setPage(state.page)
+        }
+      })
+      .catch(() => {})
+  }, [project, sourceIdentity, pageCount])
+
+  useEffect(() => {
+    if (!project || !sourceIdentity || pageCount <= 0 || loading) return
+    if (restoredPageForRef.current !== sourceIdentity) return
+    const timeout = window.setTimeout(() => {
+      void setReadingState(
+        { projectPath: project.path, sourceIdentity, title: getFileName(filePath), docType: "pdf" },
+        { page, percent: Math.round((page / pageCount) * 1000) / 10, status: "reading" },
+      ).catch(() => {})
+    }, 500)
+    return () => window.clearTimeout(timeout)
+  }, [project, sourceIdentity, pageCount, page, loading, filePath])
+
+  function handlePageMouseUp() {
+    const container = pageContainerRef.current
+    const selection = window.getSelection()
+    if (!container || !selection || selection.isCollapsed || selection.rangeCount === 0) {
+      setPendingHighlight(null)
+      return
+    }
+    const range = selection.getRangeAt(0)
+    const text = selection.toString().trim()
+    if (!text || !container.contains(range.commonAncestorContainer)) {
+      setPendingHighlight(null)
+      return
+    }
+    const box = container.getBoundingClientRect()
+    if (box.width === 0 || box.height === 0) return
+    const rects: NormalizedRect[] = Array.from(range.getClientRects())
+      .filter((rect) => rect.width > 0 && rect.height > 0)
+      .map((rect) => ({
+        xPct: (rect.left - box.left) / box.width,
+        yPct: (rect.top - box.top) / box.height,
+        wPct: rect.width / box.width,
+        hPct: rect.height / box.height,
+      }))
+    if (rects.length === 0) return
+    // Best-effort surrounding context, derived from the rendered text layer
+    // rather than the underlying PDF text stream — good enough to help a
+    // human recognize the spot later, not exact enough to re-anchor by.
+    const fullText = container.textContent ?? ""
+    const idx = fullText.indexOf(text)
+    const prefix = idx > 0 ? fullText.slice(Math.max(0, idx - 40), idx) : ""
+    const suffix = idx >= 0 ? fullText.slice(idx + text.length, idx + text.length + 40) : ""
+    const last = rects[rects.length - 1]
+    setPendingHighlight({
+      rects,
+      text,
+      prefix,
+      suffix,
+      anchorXPct: last.xPct + last.wPct,
+      anchorYPct: last.yPct + last.hPct,
+    })
+  }
+
+  async function confirmPendingHighlight(color: string) {
+    if (!pendingHighlight || !project || !sourceIdentity) return
+    const saved = await addHighlight(
+      { projectPath: project.path, sourceIdentity, title: getFileName(filePath), docType: "pdf" },
+      {
+        page,
+        rects: pendingHighlight.rects,
+        text: pendingHighlight.text,
+        prefix: pendingHighlight.prefix,
+        suffix: pendingHighlight.suffix,
+        color,
+      },
+    )
+    setHighlights((prev) => [...prev, saved])
+    setPendingHighlight(null)
+    window.getSelection()?.removeAllRanges()
+  }
+
+  async function removeHighlight(id: string) {
+    if (!project) return
+    setHighlights((prev) => prev.filter((item) => item.id !== id))
+    await deleteHighlight(project.path, id).catch(() => {
+      // Best effort: if the delete failed, the next reload of this
+      // document will bring the highlight back rather than silently
+      // desyncing the on-screen list from the database.
+    })
+  }
+
   return <div className="flex h-full min-h-0 flex-col p-4">
     <div className="mb-2 flex items-center gap-1.5 text-xs text-muted-foreground">
       <span className="min-w-0 flex-1 truncate" title={filePath}>{filePath}</span>
       <button type="button" className="rounded border px-2 py-1 hover:bg-muted" onClick={() => setShowText((value) => !value)}>{showText ? t("preview.pdfDocument") : t("preview.pdfText")}</button>
-      {!showText && <><button type="button" className="rounded p-1 hover:bg-muted" onClick={() => setZoom((value) => Math.max(50, value - 25))}><Minus className="h-3.5 w-3.5" /></button><span className="w-10 text-center">{zoom}%</span><button type="button" className="rounded p-1 hover:bg-muted" onClick={() => setZoom((value) => Math.min(300, value + 25))}><Plus className="h-3.5 w-3.5" /></button><label className="ml-1 flex items-center gap-1">{t("preview.pdfPage")}<input value={page} min={1} max={pageCount || undefined} type="number" onChange={(event) => setPage(clampPdfPage(Number(event.target.value) || 1, pageCount))} className="w-14 rounded border bg-background px-1 py-0.5" /></label><span>/ {pageCount || "–"}</span></>}
+      {!showText && <><button type="button" className="rounded p-1 hover:bg-muted" onClick={() => setZoom((value) => Math.max(50, value - 25))}><Minus className="h-3.5 w-3.5" /></button><span className="w-10 text-center">{zoom}%</span><button type="button" className="rounded p-1 hover:bg-muted" onClick={() => setZoom((value) => Math.min(300, value + 25))}><Plus className="h-3.5 w-3.5" /></button><label className="ml-1 flex items-center gap-1">{t("preview.pdfPage")}<input value={page} min={1} max={pageCount || undefined} type="number" onChange={(event) => setPage(clampPdfPage(Number(event.target.value) || 1, pageCount))} className="w-14 rounded border bg-background px-1 py-0.5" /></label><span>/ {pageCount || "–"}</span>{pageCount > 0 && <span className="text-muted-foreground/70">({Math.round((page / pageCount) * 100)}%)</span>}</>}
       <button type="button" onClick={() => void openPath(filePath)} className="rounded p-1 hover:bg-muted" title={t("preview.openWithSystem")} aria-label={t("preview.openWithSystem")}><ExternalLink className="h-3.5 w-3.5" /></button>
+      {!showText && project && sourceIdentity && (
+        <button
+          type="button"
+          onClick={() => setPanelOpen((value) => !value)}
+          className={`rounded p-1 hover:bg-muted ${panelOpen ? "bg-muted" : ""}`}
+          title={t("reader.togglePanel")}
+          aria-label={t("reader.togglePanel")}
+        >
+          <StickyNote className="h-3.5 w-3.5" />
+        </button>
+      )}
     </div>
+    <div className="flex min-h-0 flex-1 gap-2">
     <div className="min-h-0 flex-1 overflow-hidden rounded-md border bg-white">
       {showText ? <TextPreview filePath={filePath} content={content} label="PDF text" /> : loading ? (
         <div className="flex h-full items-center justify-center text-sm text-muted-foreground">{t("preview.pdfLoading")}</div>
@@ -239,17 +416,448 @@ function PdfPreview({ filePath, content }: { filePath: string; content: string }
         </div>
       ) : (
         <div className="h-full overflow-auto bg-muted/30 p-4">
-          <div className="relative mx-auto w-fit bg-white shadow-sm">
+          <div
+            ref={pageContainerRef}
+            className="relative mx-auto w-fit bg-white shadow-sm"
+            onMouseUp={handlePageMouseUp}
+          >
             <canvas ref={canvasRef} className="block" />
+            <div className="pointer-events-none absolute inset-0">
+              {highlights
+                .filter((highlight) => highlight.page === page)
+                .flatMap((highlight) => {
+                  let rects: NormalizedRect[] = []
+                  try {
+                    rects = JSON.parse(highlight.rectsJson) as NormalizedRect[]
+                  } catch {
+                    return []
+                  }
+                  const color = HIGHLIGHT_COLORS[highlight.color] ?? HIGHLIGHT_COLORS[DEFAULT_HIGHLIGHT_COLOR]
+                  return rects.map((rect, index) => (
+                    <div
+                      key={`${highlight.id}-${index}`}
+                      className="group pointer-events-auto absolute"
+                      style={{
+                        left: `${rect.xPct * 100}%`,
+                        top: `${rect.yPct * 100}%`,
+                        width: `${rect.wPct * 100}%`,
+                        height: `${rect.hPct * 100}%`,
+                        backgroundColor: color,
+                        mixBlendMode: "multiply",
+                      }}
+                      title={highlight.text}
+                    >
+                      {index === rects.length - 1 && (
+                        <div className="absolute -right-2 -top-2 hidden items-center gap-0.5 group-hover:flex" style={{ mixBlendMode: "normal" }}>
+                          <button
+                            type="button"
+                            className="flex h-4 w-4 items-center justify-center rounded-full bg-background text-[10px] leading-none text-muted-foreground shadow hover:text-foreground"
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              setPrefillHighlightId(highlight.id)
+                              setPanelOpen(true)
+                            }}
+                            aria-label={t("reader.addNote")}
+                          >
+                            <StickyNote className="h-2.5 w-2.5" />
+                          </button>
+                          <button
+                            type="button"
+                            className="flex h-4 w-4 items-center justify-center rounded-full bg-background text-[10px] leading-none text-muted-foreground shadow hover:text-destructive"
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              void removeHighlight(highlight.id)
+                            }}
+                            aria-label={t("preview.pdfDeleteHighlight")}
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  ))
+                })}
+            </div>
+            {pendingHighlight && (
+              <div
+                className="absolute z-10 flex items-center gap-1 rounded-md border bg-popover p-1 shadow-md"
+                style={{
+                  left: `${pendingHighlight.anchorXPct * 100}%`,
+                  top: `${pendingHighlight.anchorYPct * 100}%`,
+                }}
+              >
+                {Object.entries(HIGHLIGHT_COLORS).map(([name, color]) => (
+                  <button
+                    key={name}
+                    type="button"
+                    className="h-5 w-5 rounded-full border border-black/10"
+                    style={{ backgroundColor: color }}
+                    title={name}
+                    onClick={() => void confirmPendingHighlight(name)}
+                  />
+                ))}
+                <button
+                  type="button"
+                  className="ml-0.5 rounded p-0.5 text-muted-foreground hover:bg-muted"
+                  onClick={() => setPendingHighlight(null)}
+                  aria-label={t("preview.cancel")}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            )}
             <div ref={textLayerRef} className="textLayer" />
           </div>
         </div>
       )}
     </div>
+    {panelOpen && project && sourceIdentity && !showText && (
+      <ReaderSidePanel
+        projectPath={project.path}
+        sourceIdentity={sourceIdentity}
+        title={getFileName(filePath)}
+        docType="pdf"
+        currentPage={page}
+        onJumpToPage={(target) => setPage(clampPdfPage(target, pageCount))}
+        currentBookmark={{ location: JSON.stringify({ page }), label: `${t("preview.pdfPage")} ${page}` }}
+        onJumpToBookmark={(location) => {
+          try {
+            const parsed = JSON.parse(location) as { page?: number }
+            if (typeof parsed.page === "number") setPage(clampPdfPage(parsed.page, pageCount))
+          } catch {
+            // Not a PDF-shaped bookmark location; nothing sensible to jump to.
+          }
+        }}
+        currentNoteLocation={JSON.stringify({ page })}
+        onJumpToNoteLocation={(location) => {
+          try {
+            const parsed = JSON.parse(location) as { page?: number }
+            if (typeof parsed.page === "number") setPage(clampPdfPage(parsed.page, pageCount))
+          } catch {
+            // Not a PDF-shaped note location; nothing sensible to jump to.
+          }
+        }}
+        highlights={highlights}
+        prefillHighlightId={prefillHighlightId}
+        onConsumePrefill={() => setPrefillHighlightId(null)}
+        onClose={() => setPanelOpen(false)}
+      />
+    )}
+    </div>
   </div>
 }
 
+/** EPUB reader. Unlike the PDF path above (where we drive pdf.js's canvas
+ * and text layer by hand), epub.js owns rendering itself — it mounts an
+ * iframe into `viewerRef` and repaginates on resize/font changes. We just
+ * feed it file bytes and react to its `relocated`/`selected` events.
+ *
+ * Positions are EPUB CFIs (strings), not page numbers — reflowable EPUBs
+ * don't have a fixed page count, so reading progress and bookmarks store
+ * the CFI directly. Saved highlights reuse the PDF/EPUB-agnostic
+ * `rects_json` column to carry `{ "cfi": "..." }` instead of pixel rects.
+ *
+ * Known gap: freestanding (not highlight-linked) notes are stamped with
+ * `page: null` here, since the reader.db notes table has no CFI/location
+ * column of its own (only `page: INTEGER`) — they show up in the notes
+ * panel with their body and, if linked to a highlight, the highlighted
+ * text for context, but can't be jumped back to directly the way PDF page
+ * notes can. Giving notes a proper location column is a small additive
+ * migration if this turns out to matter in practice. */
+function EpubPreview({ filePath }: { filePath: string }) {
+  const { t } = useTranslation()
+  const viewerRef = useRef<HTMLDivElement | null>(null)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- epub.js's own types leave Book/Rendition's event payloads as `any`.
+  const bookRef = useRef<any>(null)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const renditionRef = useRef<any>(null)
+  const appliedHighlightsRef = useRef<Map<string, string>>(new Map())
+  const restoredForRef = useRef<string | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
+  const [locationCfi, setLocationCfi] = useState<string | null>(null)
+  const [percent, setPercent] = useState(0)
+  const [panelOpen, setPanelOpen] = useState(false)
+  const [prefillHighlightId, setPrefillHighlightId] = useState<string | null>(null)
+  const [pendingHighlight, setPendingHighlight] = useState<{ cfiRange: string; text: string } | null>(null)
+  const [highlights, setHighlights] = useState<Highlight[]>([])
+  const project = useWikiStore((state) => state.project)
+  const sourceIdentity = useMemo(
+    () => (project ? sourceIdentityForPath(project.path, filePath) : null),
+    [project, filePath],
+  )
+
+  useEffect(() => {
+    let disposed = false
+    setLoading(true)
+    setLoadError(null)
+    setLocationCfi(null)
+    setPercent(0)
+    appliedHighlightsRef.current = new Map()
+
+    void (async () => {
+      try {
+        const fileSize = await getFileSize(filePath)
+        if (fileSize > MAX_INLINE_EPUB_BYTES) throw new Error(t("preview.epubTooLarge"))
+        const [{ default: ePub }, file] = await Promise.all([
+          import("epubjs"),
+          readFileAsBase64(filePath),
+        ])
+        if (disposed) return
+        const bytes = decodeBase64(file.base64)
+        const book = ePub(bytes.buffer as ArrayBuffer)
+        bookRef.current = book
+        await book.ready
+        if (disposed) {
+          void book.destroy()
+          return
+        }
+        const container = viewerRef.current
+        if (!container) return
+        const rendition = book.renderTo(container, { width: "100%", height: "100%", flow: "paginated" })
+        renditionRef.current = rendition
+        rendition.on("relocated", (location: { start: { cfi: string; percentage: number } }) => {
+          if (disposed) return
+          setLocationCfi(location.start.cfi)
+          setPercent(Math.round(location.start.percentage * 1000) / 10)
+        })
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        rendition.on("selected", (cfiRange: string, contents: any) => {
+          if (disposed) return
+          const text = (contents?.window?.getSelection?.()?.toString() ?? "").trim()
+          if (text) setPendingHighlight({ cfiRange, text })
+        })
+        await rendition.display()
+        if (!disposed) setLoading(false)
+      } catch (error) {
+        if (!disposed) {
+          setLoadError(error instanceof Error ? error.message : String(error))
+          setLoading(false)
+        }
+      }
+    })()
+
+    return () => {
+      disposed = true
+      renditionRef.current?.destroy?.()
+      void bookRef.current?.destroy?.()
+      renditionRef.current = null
+      bookRef.current = null
+    }
+  }, [filePath, reloadKey, t])
+
+  useEffect(() => {
+    if (!project || !sourceIdentity) {
+      setHighlights([])
+      return
+    }
+    let disposed = false
+    void listHighlights(project.path, sourceIdentity)
+      .then((items) => {
+        if (!disposed) setHighlights(items)
+      })
+      .catch(() => {
+        if (!disposed) setHighlights([])
+      })
+    return () => {
+      disposed = true
+    }
+  }, [project, sourceIdentity])
+
+  // Restore the last-read CFI once per document, before the save effect
+  // below starts persisting relocations — same ordering guard as PdfPreview.
+  useEffect(() => {
+    if (!project || !sourceIdentity || loading || !renditionRef.current) return
+    if (restoredForRef.current === sourceIdentity) return
+    restoredForRef.current = sourceIdentity
+    void getReadingState(project.path, sourceIdentity)
+      .then((state) => {
+        if (state?.location) void renditionRef.current?.display(state.location)
+      })
+      .catch(() => {})
+  }, [project, sourceIdentity, loading])
+
+  useEffect(() => {
+    if (!project || !sourceIdentity || !locationCfi) return
+    if (restoredForRef.current !== sourceIdentity) return
+    const timeout = window.setTimeout(() => {
+      void setReadingState(
+        { projectPath: project.path, sourceIdentity, title: getFileName(filePath), docType: "epub" },
+        { location: locationCfi, percent, status: "reading" },
+      ).catch(() => {})
+    }, 500)
+    return () => window.clearTimeout(timeout)
+  }, [project, sourceIdentity, locationCfi, percent, filePath])
+
+  // Keep epub.js's own annotation layer (which does the actual highlight
+  // painting inside its iframe) in sync with the saved highlight list,
+  // diffing against what we last applied rather than clearing and
+  // re-adding everything on every render.
+  useEffect(() => {
+    const rendition = renditionRef.current
+    if (!rendition) return
+    const applied = appliedHighlightsRef.current
+    const currentIds = new Set(highlights.map((item) => item.id))
+    for (const [id, cfiRange] of applied) {
+      if (!currentIds.has(id)) {
+        rendition.annotations.remove(cfiRange, "highlight")
+        applied.delete(id)
+      }
+    }
+    for (const highlight of highlights) {
+      if (applied.has(highlight.id)) continue
+      let cfiRange: string | null = null
+      try {
+        const parsed = JSON.parse(highlight.rectsJson) as { cfi?: string }
+        cfiRange = parsed.cfi ?? null
+      } catch {
+        cfiRange = null
+      }
+      if (!cfiRange) continue
+      const color = HIGHLIGHT_COLORS[highlight.color] ?? HIGHLIGHT_COLORS[DEFAULT_HIGHLIGHT_COLOR]
+      rendition.annotations.highlight(
+        cfiRange,
+        {},
+        () => void removeHighlight(highlight.id),
+        "epub-highlight",
+        { fill: color, "fill-opacity": "1", "mix-blend-mode": "multiply", cursor: "pointer" },
+      )
+      applied.set(highlight.id, cfiRange)
+    }
+    // removeHighlight is stable across renders (defined below with no
+    // dependency on component state other than refs/setters).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [highlights])
+
+  async function confirmPendingHighlight(color: string) {
+    if (!pendingHighlight || !project || !sourceIdentity) return
+    const saved = await addHighlight(
+      { projectPath: project.path, sourceIdentity, title: getFileName(filePath), docType: "epub" },
+      {
+        rects: { cfi: pendingHighlight.cfiRange } as unknown as NormalizedRect,
+        text: pendingHighlight.text,
+        color,
+      },
+    )
+    setHighlights((prev) => [...prev, saved])
+    setPendingHighlight(null)
+    renditionRef.current?.getContents?.()?.forEach?.((contents: { window: Window }) => {
+      contents.window.getSelection()?.removeAllRanges()
+    })
+  }
+
+  async function removeHighlight(id: string) {
+    if (!project) return
+    setHighlights((prev) => prev.filter((item) => item.id !== id))
+    await deleteHighlight(project.path, id).catch(() => {})
+  }
+
+  return <div className="flex h-full min-h-0 flex-col p-4">
+    <div className="mb-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+      <span className="min-w-0 flex-1 truncate" title={filePath}>{filePath}</span>
+      {pageCountLabel(percent, t)}
+      <button type="button" onClick={() => void openPath(filePath)} className="rounded p-1 hover:bg-muted" title={t("preview.openWithSystem")} aria-label={t("preview.openWithSystem")}><ExternalLink className="h-3.5 w-3.5" /></button>
+      {project && sourceIdentity && (
+        <button
+          type="button"
+          onClick={() => setPanelOpen((value) => !value)}
+          className={`rounded p-1 hover:bg-muted ${panelOpen ? "bg-muted" : ""}`}
+          title={t("reader.togglePanel")}
+          aria-label={t("reader.togglePanel")}
+        >
+          <StickyNote className="h-3.5 w-3.5" />
+        </button>
+      )}
+    </div>
+    <div className="flex min-h-0 flex-1 gap-2">
+      <div className="relative min-h-0 flex-1 overflow-hidden rounded-md border bg-white">
+        {loadError ? (
+          <div className="flex h-full flex-col items-center justify-center gap-3 p-6 text-center text-sm text-muted-foreground">
+            <FileQuestion className="h-8 w-8" />
+            <p>{t("preview.epubLoadError")}</p>
+            <p className="max-w-xl break-words text-xs opacity-70">{loadError}</p>
+            <button type="button" className="rounded border px-3 py-1.5 hover:bg-muted" onClick={() => setReloadKey((value) => value + 1)}>{t("preview.reload")}</button>
+          </div>
+        ) : (
+          <>
+            {loading && (
+              <div className="absolute inset-0 z-10 flex items-center justify-center bg-white text-sm text-muted-foreground">
+                {t("preview.epubLoading")}
+              </div>
+            )}
+            <div ref={viewerRef} className="h-full w-full" />
+            {!loading && (
+              <>
+                <button
+                  type="button"
+                  className="absolute left-1 top-1/2 -translate-y-1/2 rounded-full bg-background/80 p-1.5 shadow hover:bg-muted"
+                  onClick={() => void renditionRef.current?.prev?.()}
+                  aria-label={t("reader.previousPage")}
+                >
+                  ‹
+                </button>
+                <button
+                  type="button"
+                  className="absolute right-1 top-1/2 -translate-y-1/2 rounded-full bg-background/80 p-1.5 shadow hover:bg-muted"
+                  onClick={() => void renditionRef.current?.next?.()}
+                  aria-label={t("reader.nextPage")}
+                >
+                  ›
+                </button>
+              </>
+            )}
+            {pendingHighlight && (
+              <div className="absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1 rounded-md border bg-popover p-1 shadow-md">
+                {Object.entries(HIGHLIGHT_COLORS).map(([name, color]) => (
+                  <button
+                    key={name}
+                    type="button"
+                    className="h-5 w-5 rounded-full border border-black/10"
+                    style={{ backgroundColor: color }}
+                    title={name}
+                    onClick={() => void confirmPendingHighlight(name)}
+                  />
+                ))}
+                <button
+                  type="button"
+                  className="ml-0.5 rounded p-0.5 text-muted-foreground hover:bg-muted"
+                  onClick={() => setPendingHighlight(null)}
+                  aria-label={t("preview.cancel")}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+      {panelOpen && project && sourceIdentity && (
+        <ReaderSidePanel
+          projectPath={project.path}
+          sourceIdentity={sourceIdentity}
+          title={getFileName(filePath)}
+          docType="epub"
+          currentBookmark={locationCfi ? { location: locationCfi, label: `${t("preview.pdfPage")} · ${percent}%` } : null}
+          onJumpToBookmark={(location) => void renditionRef.current?.display(location)}
+          currentNoteLocation={locationCfi}
+          onJumpToNoteLocation={(location) => void renditionRef.current?.display(location)}
+          highlights={highlights}
+          prefillHighlightId={prefillHighlightId}
+          onConsumePrefill={() => setPrefillHighlightId(null)}
+          onClose={() => setPanelOpen(false)}
+        />
+      )}
+    </div>
+  </div>
+}
+
+function pageCountLabel(percent: number, t: (key: string) => string): ReactElement {
+  return <span className="whitespace-nowrap">{t("reader.progress")} {percent}%</span>
+}
+
 const MAX_INLINE_PDF_BYTES = 128 * 1024 * 1024
+const MAX_INLINE_EPUB_BYTES = 64 * 1024 * 1024
 
 export function decodeBase64(value: string): Uint8Array {
   const binary = atob(value)

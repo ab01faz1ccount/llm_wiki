@@ -51,6 +51,10 @@ futures = "0.3"
 tokio = { version = "1", features = ["process", "io-util", "sync", "macros", "rt", "time"] }
 which = "7"
 uuid = { version = "1", features = ["v4"] }
+# Reader store (highlights/notes/bookmarks/reading progress): one small
+# per-project SQLite file. `bundled` compiles SQLite in so we don't
+# depend on a system libsqlite3 (matters most for Windows/CI).
+rusqlite = { version = "0.32", features = ["bundled"] }
 # Multimodal image extraction (Phase 1):
 #   `image` re-encodes pdfium's raw bitmap output to PNG so the IPC
 #   payload is self-contained (the frontend doesn't need to know
@@ -73,6 +77,7 @@ html2text = { version = "0.17.1", default-features = false, features = ["xml"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+tempfile = "3"
 
 [profile.release]
 codegen-units = 1

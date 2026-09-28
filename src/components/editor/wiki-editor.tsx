@@ -12,7 +12,10 @@ import { applyTextSelectionEdit, readFile } from "@/commands/fs"
 import { streamChat } from "@/lib/llm-client"
 import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 import { searchWiki, type SearchResult } from "@/lib/search"
-import { normalizePath } from "@/lib/path-utils"
+import { normalizePath, getFileName } from "@/lib/path-utils"
+import { sourceIdentityForPath } from "@/lib/source-identity"
+import { addHighlight, deleteHighlight, listHighlights, type Highlight } from "@/lib/reader-db"
+import { MARKDOWN_HIGHLIGHT_COLORS } from "@/lib/markdown-highlight"
 
 interface EditorSelectionRequest {
   id: string
@@ -65,6 +68,11 @@ export function WikiEditor({ content, onSave, filePath }: WikiEditorProps) {
   const selectionRunIdRef = useRef(0)
   const project = useWikiStore((state) => state.project)
   const llmConfig = useWikiStore((state) => state.llmConfig)
+  const sourceIdentity = useMemo(
+    () => (project && filePath ? sourceIdentityForPath(project.path, filePath) : null),
+    [project, filePath],
+  )
+  const [highlights, setHighlights] = useState<Highlight[]>([])
 
   // Read mode renders frontmatter as UI plus the Markdown body. Edit mode uses
   // a plain-text Markdown editor for the full file so frontmatter can be edited
@@ -164,6 +172,53 @@ export function WikiEditor({ content, onSave, filePath }: WikiEditorProps) {
     selectionRunIdRef.current += 1
     selectionAbortRef.current?.abort()
   }, [])
+
+  useEffect(() => {
+    if (!project || !sourceIdentity) {
+      setHighlights([])
+      return
+    }
+    let disposed = false
+    void listHighlights(project.path, sourceIdentity)
+      .then((items) => {
+        if (!disposed) setHighlights(items)
+      })
+      .catch(() => {
+        if (!disposed) setHighlights([])
+      })
+    return () => {
+      disposed = true
+    }
+  }, [project, sourceIdentity])
+
+  const saveHighlightFromSelection = useCallback(async (color: string) => {
+    if (!project || !sourceIdentity || !selectionRequest || !filePath) return
+    const saved = await addHighlight(
+      { projectPath: project.path, sourceIdentity, title: getFileName(filePath), docType: "markdown" },
+      {
+        text: selectionRequest.selectedText,
+        prefix: selectionRequest.prefix.slice(-40),
+        suffix: selectionRequest.suffix.slice(0, 40),
+        color,
+        // No PDF-style rects or EPUB-style CFI here — a saved highlight's
+        // markdown text is re-located by exact-text match at render time
+        // (see rehypeHighlightMarks), so there's no geometry to persist.
+        rects: [],
+      },
+    )
+    setHighlights((prev) => [...prev, saved])
+  }, [project, sourceIdentity, selectionRequest, filePath])
+
+  const removeHighlightById = useCallback(async (highlightId: string) => {
+    if (!project) return
+    setHighlights((prev) => prev.filter((item) => item.id !== highlightId))
+    await deleteHighlight(project.path, highlightId).catch(() => {})
+  }, [project])
+
+  const readerHighlights = useMemo(
+    () => highlights.map((item) => ({ id: item.id, text: item.text, color: item.color })),
+    [highlights],
+  )
 
   const submitSelectionToAgent = useCallback(async (intent: "ask" | "edit") => {
     if (!selectionRequest || !selectionInstruction.trim() || selectionRunning) return
@@ -369,6 +424,8 @@ export function WikiEditor({ content, onSave, filePath }: WikiEditorProps) {
             sourceBody={bodySourceOffset >= 0 ? body : undefined}
             sourceOffset={bodySourceOffset >= 0 ? bodySourceOffset : undefined}
             filePath={filePath}
+            highlights={readerHighlights}
+            onHighlightClick={(id) => void removeHighlightById(id)}
           />
         </div>
       ) : (
@@ -409,6 +466,21 @@ export function WikiEditor({ content, onSave, filePath }: WikiEditorProps) {
             <div className="mb-3 rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-xs leading-5 text-muted-foreground">
               {selectionRequest.selectedText}
             </div>
+            {sourceIdentity && (
+              <div className="mb-3 flex items-center gap-1.5">
+                <span className="text-xs text-muted-foreground">{t("editor.selection.highlight")}</span>
+                {Object.entries(MARKDOWN_HIGHLIGHT_COLORS).map(([name, color]) => (
+                  <button
+                    key={name}
+                    type="button"
+                    className="h-5 w-5 rounded-full border border-black/10"
+                    style={{ backgroundColor: color }}
+                    title={name}
+                    onClick={() => void saveHighlightFromSelection(name)}
+                  />
+                ))}
+              </div>
+            )}
             {!selectionRequest.sourceMapped && (
               <p className="mb-3 rounded-md border border-border bg-muted/40 p-2 text-xs leading-5 text-muted-foreground">
                 {t("editor.selection.askOnlyHint")}
